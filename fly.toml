@@ -1,0 +1,22 @@
+# Fly.io app config. The app name below becomes your free hostname:
+#   https://chaitanyasachidanand.fly.dev
+#
+# EDIT ME if that name is already taken — run `flyctl launch --no-deploy`
+# once and it will offer to update this file interactively, or edit `app`
+# below by hand before your first `flyctl deploy`.
+app = "chaitanyasachidanand"
+primary_region = "bom" # Mumbai. Change to "sin" (Singapore) if bom is unavailable.
+
+[build]
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = true
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ["app"]
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

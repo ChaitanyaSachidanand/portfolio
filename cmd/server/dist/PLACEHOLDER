@@ -1,0 +1,4 @@
+This directory is populated by `make generate` (or the Docker build) before
+cmd/server is compiled — the server embeds whatever is here via go:embed.
+This placeholder file exists only so the package compiles (go:embed requires
+a non-empty directory) before you've run the generator locally.

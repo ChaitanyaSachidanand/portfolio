@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{.Name}} — {{.Role}}</title>
+  <meta name="description" content="{{.Tagline}}">
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 24 24%22><text y=%2218%22 font-size=%2218%22>&#9673;</text></svg>">
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header class="nav">
+    <a class="nav-brand" href="#top">{{.Name}}</a>
+    <nav class="nav-links">
+      <a href="#about">About</a>
+      <a href="#skills">Skills</a>
+      <a href="#projects">Projects</a>
+      <a href="#contact">Contact</a>
+    </nav>
+  </header>
+
+  <main>
+    <section id="top" class="hero">
+      <p class="eyebrow">{{.Role}}</p>
+      <h1>{{.Name}}</h1>
+      <p class="tagline">{{.Tagline}}</p>
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="#projects">See projects</a>
+        <a class="btn btn-ghost" href="#contact">Get in touch</a>
+      </div>
+    </section>
+
+    <section id="about" class="section">
+      <h2 class="section-title">About</h2>
+      <div class="prose">
+        {{range .About}}<p>{{.}}</p>
+        {{end}}
+      </div>
+    </section>
+
+    <section id="skills" class="section">
+      <h2 class="section-title">Skills</h2>
+      <div class="skill-groups">
+        {{range .Skills}}
+        <div class="skill-group">
+          <h3>{{.Category}}</h3>
+          <ul class="tag-list">
+            {{range .Items}}<li class="tag">{{.}}</li>{{end}}
+          </ul>
+        </div>
+        {{end}}
+      </div>
+    </section>
+
+    <section id="projects" class="section">
+      <h2 class="section-title">Projects</h2>
+      <div class="project-grid">
+        {{range .Projects}}
+        <article class="project-card">
+          <div class="project-card-head">
+            <h3>{{.Name}}</h3>
+            {{if .Status}}<span class="status-badge">{{.Status}}</span>{{end}}
+          </div>
+          <p class="project-tagline">{{.Tagline}}</p>
+          <p class="project-desc">{{.Description}}</p>
+          {{if .Stack}}
+          <ul class="tag-list tag-list-small">
+            {{range .Stack}}<li class="tag">{{.}}</li>{{end}}
+          </ul>
+          {{end}}
+          {{if .Links}}
+          <div class="project-links">
+            {{range .Links}}
+            <a class="project-link" href="{{.URL}}" target="_blank" rel="noopener noreferrer">
+              {{template "icon" .Icon}} {{.Label}}
+            </a>
+            {{end}}
+          </div>
+          {{end}}
+        </article>
+        {{end}}
+      </div>
+    </section>
+
+    <section id="contact" class="section contact-section">
+      <h2 class="section-title">Get in touch</h2>
+      <p class="prose">Open to interesting problems in Go, distributed systems, and AI agents.</p>
+      <div class="contact-links">
+        {{range .Contact}}
+        <a class="contact-link" href="{{.URL}}" target="_blank" rel="noopener noreferrer">
+          {{template "icon" .Icon}} {{.Label}}
+        </a>
+        {{end}}
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <p>&copy; {{.Year}} {{.Name}}. Built with Go.</p>
+  </footer>
+</body>
+</html>
+
+{{define "icon"}}{{if eq . "mail"}}<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 4h16v16H4z"/><path d="M4 6l8 7 8-7"/></svg>{{else if eq . "github"}}<svg class="icon" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2C6.48 2 2 6.58 2 12.25c0 4.53 2.87 8.37 6.84 9.73.5.1.68-.22.68-.49 0-.24-.01-.87-.01-1.71-2.78.62-3.37-1.37-3.37-1.37-.45-1.17-1.11-1.48-1.11-1.48-.91-.64.07-.63.07-.63 1 .07 1.53 1.05 1.53 1.05.89 1.56 2.34 1.11 2.91.85.09-.66.35-1.11.63-1.37-2.22-.26-4.56-1.14-4.56-5.06 0-1.12.39-2.03 1.03-2.75-.1-.26-.45-1.31.1-2.73 0 0 .84-.28 2.75 1.05a9.3 9.3 0 0 1 5 0c1.91-1.33 2.75-1.05 2.75-1.05.55 1.42.2 2.47.1 2.73.64.72 1.03 1.63 1.03 2.75 0 3.93-2.34 4.79-4.57 5.05.36.32.68.94.68 1.9 0 1.37-.01 2.47-.01 2.81 0 .27.18.6.69.49A10.26 10.26 0 0 0 22 12.25C22 6.58 17.52 2 12 2z"/></svg>{{else if eq . "linkedin"}}<svg class="icon" viewBox="0 0 24 24" fill="currentColor"><path d="M4.98 3.5C4.98 4.88 3.87 6 2.5 6S0 4.88 0 3.5 1.12 1 2.5 1s2.48 1.12 2.48 2.5zM.5 8.24H4.5V23H.5V8.24zM8.5 8.24h3.83v2.01h.05c.53-1 1.84-2.06 3.78-2.06 4.05 0 4.8 2.67 4.8 6.13V23h-4v-6.75c0-1.61-.03-3.68-2.24-3.68-2.25 0-2.59 1.76-2.59 3.57V23h-4V8.24z"/></svg>{{else if eq . "x"}}<svg class="icon" viewBox="0 0 24 24" fill="currentColor"><path d="M18.9 2H22l-7.6 8.7L23.3 22h-6.9l-5.4-6.9L4.8 22H1.7l8.1-9.3L1 2h7.1l4.9 6.3L18.9 2zm-1.2 18h1.9L7.4 3.9H5.3L17.7 20z"/></svg>{{else}}<svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M7 17L17 7"/><path d="M7 7h10v10"/></svg>{{end}}{{end}}

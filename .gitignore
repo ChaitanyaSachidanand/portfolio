@@ -1,0 +1,4 @@
+/dist/
+/bin/
+/cmd/server/dist/*
+!/cmd/server/dist/PLACEHOLDER
