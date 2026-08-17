@@ -170,6 +170,7 @@ main {
   list-style: none;
   display: flex;
   flex-wrap: wrap;
+  align-items: flex-start;
   gap: 0.5rem;
   padding: 0;
   margin: 0;
