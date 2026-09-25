@@ -1,0 +1,5 @@
+__pycache__/
+data/
+paper_state.json*
+paper_journal.jsonl
+KILL
