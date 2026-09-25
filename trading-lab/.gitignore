@@ -5,3 +5,5 @@ paper_journal.jsonl
 KILL
 registry.json
 learn_log.jsonl
+calibration.json
+calibration.pending.json

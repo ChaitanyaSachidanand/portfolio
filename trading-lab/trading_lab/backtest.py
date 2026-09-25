@@ -71,6 +71,10 @@ def run_backtest(
         if utc_day(bar.open_time) != day:
             day, day_start = utc_day(bar.open_time), equity
 
+        if hasattr(strategy, "account"):
+            strategy.account = {"dd_pct": round((1 - equity / peak) * 100, 2),
+                                "day_pct": round((equity / day_start - 1) * 100, 2),
+                                "exposure": round(broker.exposure(bar.close), 3)}
         window = candles[max(0, i - strategy.warmup - 1): i + 1]
         raw = strategy.target(window, broker.exposure(bar.close))
         decision = risk.check(raw, equity, peak, day_start)

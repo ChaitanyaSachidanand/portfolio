@@ -29,7 +29,8 @@ from .strategies import STRATEGIES
 GRIDS = {
     "trend": {"fast": [10, 20, 50], "slow": [100, 200]},
     "meanrev": {"entry": [25, 30, 35], "exit": [50, 60]},
-    "jev": {"min_confidence": [0.05, 0.2, 0.4, 0.6], "min_p_up": [0.5, 0.55, 0.6]},
+    "donchian": {"entry": [20, 55], "exit": [10, 20], "trend_filter": [50, 100]},
+    "jev": {"min_confidence": [0.3, 0.5, 0.8], "min_p_long": [0.5, 0.55, 0.6]},
 }
 
 
@@ -143,9 +144,10 @@ def calibration_report(pairs: list[tuple[float, int]]) -> str:
         return f"only {len(pairs)} scored predictions; need at least 30 before calibration means anything"
     base = sum(y for _, y in pairs) / len(pairs)
     b, b0 = brier(pairs), brier([(base, y) for _, y in pairs])
+    skill = f"skill {1 - b / b0:+.1%}" if b0 > 0 else "skill n/a (every outcome was the same)"
     lines = [f"predictions {len(pairs)}   Brier {b:.4f}   base-rate Brier {b0:.4f}   "
-             f"skill {1 - b / b0:+.1%} ({'better' if b < b0 else 'NOT better'} than guessing the base rate)",
-             "p_up bucket   n     predicted  actual"]
+             f"{skill} ({'better' if b < b0 else 'NOT better'} than guessing the base rate)",
+             "p bucket      n     predicted  actual"]
     for lo in [0.0, 0.2, 0.4, 0.5, 0.6, 0.8]:
         hi = {0.0: 0.2, 0.2: 0.4, 0.4: 0.5, 0.5: 0.6, 0.6: 0.8, 0.8: 1.01}[lo]
         bucket = [(p, y) for p, y in pairs if lo <= p < hi]

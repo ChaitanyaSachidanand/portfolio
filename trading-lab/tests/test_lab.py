@@ -115,7 +115,10 @@ if __name__ == "__main__":
 import math
 import random
 
-from trading_lab.jev import MockJev, build_state, parse_answers
+from trading_lab.brain import Brain, Verdict
+from trading_lab.jev import Calibration, JevDecision, MalformedAnswer, MockJev, build_state, parse_answers
+from trading_lab.review import Record, fit, label, nightly
+from trading_lab.strategies import Donchian
 from trading_lab.learn import Registry, WalkForward, brier, calibration_report, walk_forward
 from trading_lab.strategies import JevStrategy
 
@@ -160,33 +163,149 @@ class LearnTests(unittest.TestCase):
         self.assertIn("NOT better", calibration_report([(0.9, 0), (0.1, 1)] * 20))
 
 
+def answers(regime="trending", direction="long", p_long=0.9, conf=0.9, toxic=0.1, setup=2.5, risk="safe"):
+    rest = (1 - p_long) / 2
+    return {
+        "regime": {"type": "choice", "choice": regime, "confidence": conf,
+                   "probabilities": {"trending": 0.25, "mean_reverting": 0.25, "high_vol": 0.25, "crisis": 0.25}},
+        "direction": {"type": "choice", "choice": direction, "confidence": conf,
+                      "probabilities": {"long": p_long, "short": rest, "neutral": rest}},
+        "toxic_flow": {"type": "noul", "noul": toxic},
+        "setup_quality": {"type": "score", "score": setup, "confidence": 0.7},
+        "risk_state": {"type": "choice", "choice": risk, "confidence": 0.8,
+                       "probabilities": {"safe": 0.8, "near_limit": 0.1, "reduce": 0.1}},
+    }
+
+
+class Fixed:
+    def __init__(self, **kw):
+        self.d = parse_answers(answers(**kw))
+
+    def decide(self, state):
+        return self.d
+
+
+class FakeBrain:
+    def __init__(self, action, hours=4):
+        self.verdict, self.calls = Verdict(action, hours, "test", "opus"), 0
+
+    def review(self, packet):
+        self.calls += 1
+        return self.verdict
+
+
 class JevTests(unittest.TestCase):
-    def test_parse_answers_with_and_without_confidence(self):
-        body = {"answers": {"regime": {"choice": "trending", "probabilities": {"trending": 0.7, "crisis": 0.3}},
-                            "direction": {"choice": "up", "probabilities": {"up": 0.8, "down_or_flat": 0.2},
-                                          "confidence": 0.65}}}
-        d = parse_answers(body, 12.0)
-        self.assertEqual((d.regime, d.direction, d.p_up, d.confidence), ("trending", "up", 0.8, 0.65))
-        del body["answers"]["direction"]["confidence"]
-        self.assertTrue(0 < parse_answers(body, 0).confidence < 1)
+    def test_parse_strict_and_fail_closed(self):
+        d = parse_answers(answers())
+        self.assertEqual((d.regime, d.direction, d.p_long, d.setup_quality), ("trending", "long", 0.9, 2.5))
+        bad = answers()
+        bad["direction"]["probabilities"] = {"up": 1.0}
+        with self.assertRaises(MalformedAnswer):
+            parse_answers(bad)
+        bad = answers()
+        del bad["toxic_flow"]
+        with self.assertRaises(MalformedAnswer):
+            parse_answers(bad)
 
-    def test_crisis_or_low_confidence_blocks_trade(self):
-        class Fixed:
-            def __init__(self, regime, p, conf):
-                self.d = parse_answers({"regime": {"choice": regime},
-                                        "direction": {"choice": "up", "probabilities": {"up": p, "down_or_flat": 1 - p},
-                                                      "confidence": conf}}, 0)
-
-            def decide(self, state):
-                return self.d
-
+    def test_gates(self):
         hist = trending(200)
-        self.assertEqual(JevStrategy(Fixed("crisis", 0.9, 0.9)).target(hist, 0), 0.0)
-        self.assertEqual(JevStrategy(Fixed("trending", 0.9, 0.3)).target(hist, 0), 0.0)
-        self.assertGreater(JevStrategy(Fixed("trending", 0.9, 0.9)).target(hist, 0), 0.0)
+        cal = Calibration()
+        cal.win_rate, cal.samples = [None] * 5 + [0.9], [0] * 5 + [10_000]  # trust p=0.9 as-is
+        ok = JevStrategy(Fixed(), calibration=cal)
+        self.assertGreater(ok.target(hist, 0), 0.0)
+        for kw in [dict(regime="crisis"), dict(conf=0.5), dict(setup=1.0), dict(risk="near_limit"),
+                   dict(toxic=0.7), dict(direction="neutral")]:
+            s = JevStrategy(Fixed(**kw), calibration=cal)
+            self.assertEqual(s.target(hist, 0), 0.0, kw)
+            self.assertTrue(s.last_gates, kw)
+        # Uncalibrated, p=0.9 shrinks to 0.7, still above 0.55; p=0.6 shrinks to 0.55 boundary.
+        self.assertEqual(JevStrategy(Fixed(p_long=0.58)).target(hist, 0), 0.0)
+
+    def test_exits_need_no_confidence(self):
+        hist = trending(200)
+        self.assertEqual(JevStrategy(Fixed(regime="crisis", conf=0.1)).target(hist, 0.5), 0.0)
+        self.assertEqual(JevStrategy(Fixed(risk="reduce")).target(hist, 0.5), 0.25)
+
+        class Abstains:
+            def decide(self, state):
+                return JevDecision.abstain("down")
+
+        self.assertEqual(JevStrategy(Abstains()).target(hist, 0.5), 0.0)
+
+    def test_brain_can_only_reduce(self):
+        hist = trending(200)
+
+        class LowConfJev(Fixed):
+            def __init__(self):
+                super().__init__(conf=0.5)
+                self.d = JevDecision(**{**self.d.__dict__, "source": "jev"})
+
+        s = JevStrategy(LowConfJev(), brain=FakeBrain("flatten"))
+        self.assertEqual(s.target(hist, 0.5), 0.0)
+        s = JevStrategy(LowConfJev(), brain=FakeBrain("pause", 4), min_confidence=0.4)
+        self.assertEqual(s.target(hist, 0.0), 0.0)
+        self.assertIn("paused by brain", s.last_gates)
+        self.assertEqual(s.target(hist, 0.3), 0.3)  # pause keeps, never adds
+
+    def test_brain_fails_closed_without_sdk_or_key(self):
+        v = Brain().review({"x": 1})
+        self.assertIn(v.action, ("pause", "no_change", "flatten"))
+        if not Brain().available:
+            self.assertEqual((v.action, v.source), ("pause", "fallback"))
 
     def test_state_is_compact_and_mock_runs(self):
         state = build_state(synthetic(200), 4, 0.3)
-        self.assertLess(len(str(state)), 800)
+        self.assertLess(len(str(state)), 700)
         d = MockJev().decide(state)
-        self.assertTrue(0 <= d.p_up <= 1)
+        self.assertTrue(0 <= d.p_long <= 1)
+        self.assertEqual(d.source, "mock")
+
+
+class DonchianTests(unittest.TestCase):
+    def test_breakout_entry_and_sizing(self):
+        hist = trending(120)
+        top = max(c.high for c in hist[-21:])
+        last = hist[-1]
+        hist.append(Candle(last.open_time + 3_600_000, last.close, top * 1.01, last.close, top * 1.01, 1))
+        t = Donchian().target(hist, 0.0)
+        self.assertGreater(t, 0.0)
+        self.assertLessEqual(t, 0.4)
+
+    def test_exit_on_breakdown(self):
+        hist = trending(120)
+        last = hist[-1]
+        crash = Candle(last.open_time + 3_600_000, last.close, last.close, last.close * 0.8, last.close * 0.8, 1)
+        self.assertEqual(Donchian().target(hist + [crash], 0.3), 0.0)
+        self.assertEqual(Donchian().target(hist, 0.3), 0.3)  # holds while trend intact
+
+
+class ReviewTests(unittest.TestCase):
+    def test_fit_is_monotone_and_shrinks(self):
+        recs, closes = [], {}
+        rng = random.Random(3)
+        for i in range(400):
+            p = rng.random()
+            t = i * 2 * 3_600_000
+            recs.append(Record(t, 100.0, p, p, ["setup x"]))
+            closes[t + 3_600_000] = 101.0 if rng.random() < 0.5 else 99.0
+        labeled = label(recs, closes, 3_600_000)
+        self.assertEqual(len(labeled), 400)
+        cal = fit(labeled, Calibration())
+        rates = [r for r in cal.win_rate if r is not None]
+        self.assertEqual(rates, sorted(rates))
+        self.assertEqual(cal.version, 1)
+        self.assertAlmostEqual(Calibration().apply(0.9), 0.7)
+
+    def test_nightly_writes_pending_not_live(self):
+        with tempfile.TemporaryDirectory() as d:
+            live, pending = os.path.join(d, "c.json"), os.path.join(d, "p.json")
+            recs = [Record(i * 7_200_000, 100.0, 0.7, 0.6, []) for i in range(50)]
+            closes = {i * 7_200_000 + 3_600_000: 101.0 for i in range(50)}
+            out = nightly(recs, closes, 3_600_000, live, pending)
+            self.assertTrue(os.path.exists(pending))
+            self.assertFalse(os.path.exists(live))
+            self.assertIn("proposed calibration v1", out)
+
+
+if __name__ == "__main__":
+    unittest.main()

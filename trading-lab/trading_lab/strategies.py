@@ -5,30 +5,8 @@ trade; the risk engine and broker do that.
 """
 from __future__ import annotations
 
-import math
-
 from .data import Candle
-
-
-def sma(values: list[float], n: int) -> float:
-    return sum(values[-n:]) / n
-
-
-def realized_vol(closes: list[float], n: int) -> float:
-    rets = [math.log(closes[i] / closes[i - 1]) for i in range(len(closes) - n, len(closes))]
-    mean = sum(rets) / n
-    return math.sqrt(sum((r - mean) ** 2 for r in rets) / (n - 1))
-
-
-def rsi(closes: list[float], n: int) -> float:
-    gains = losses = 0.0
-    for i in range(len(closes) - n, len(closes)):
-        d = closes[i] - closes[i - 1]
-        gains += max(d, 0.0)
-        losses += max(-d, 0.0)
-    if losses == 0:
-        return 100.0
-    return 100.0 - 100.0 / (1.0 + gains / losses)
+from .strategies_math import atr, realized_vol, rsi, sma  # noqa: F401 (re-exported)
 
 
 class Strategy:
@@ -81,35 +59,120 @@ class MeanReversion(Strategy):
         return 0.5 if value <= self.entry and in_uptrend else 0.0
 
 
-class JevStrategy(Strategy):
-    """Jev judges regime and direction; deterministic gates here decide whether that is enough.
+class Donchian(Strategy):
+    """Daily-bar breakout, the rule behind the one public small-account system with checkable numbers
+    (github.com/Wataru1987/gmo-coin-trend-lab; see docs/RESEARCH.md). Reimplemented, stateless variant.
 
-    Gates (from the fund prompt): no position in a crisis regime, and none unless Jev's confidence
-    is at least `min_confidence` and p_up clears `min_p_up`. Size is volatility-scaled like TrendFollow.
+    Entry: close above the prior `entry`-bar high and above the `trend_filter`-bar average.
+    Exit:  close below the prior `exit`-bar low, or below (highest close of the last `entry` bars
+           minus `stop_atr` x ATR), a stateless stand-in for a trailing stop.
+    Size:  risk `risk_per_trade` of equity at a `stop_atr` x ATR stop, capped at `max_exposure`.
+    Designed for --interval 1d.
     """
 
-    def __init__(self, engine=None, min_confidence: float = 0.60, min_p_up: float = 0.55,
-                 horizon_bars: int = 4, round_trip_cost_pct: float = 0.3, target_vol: float = 0.008,
+    def __init__(self, entry: int = 20, exit: int = 10, trend_filter: int = 50, atr_n: int = 14,
+                 stop_atr: float = 2.0, risk_per_trade: float = 0.01, max_exposure: float = 0.4):
+        self.entry, self.exit, self.trend_filter, self.atr_n = entry, exit, trend_filter, atr_n
+        self.stop_atr, self.risk_per_trade, self.max_exposure = stop_atr, risk_per_trade, max_exposure
+        self.id = f"donchian_{entry}_{exit}_{trend_filter}"
+        self.warmup = max(entry, exit, trend_filter, atr_n) + 1
+
+    def target(self, history, current_exposure):
+        bar, closes = history[-1], [c.close for c in history]
+        a = atr(history, self.atr_n)
+        if current_exposure > 0.01:
+            prior_low = min(c.low for c in history[-self.exit - 1:-1])
+            trail = max(closes[-self.entry:]) - self.stop_atr * a
+            return 0.0 if bar.close < prior_low or bar.close < trail else current_exposure
+        prior_high = max(c.high for c in history[-self.entry - 1:-1])
+        if bar.close > prior_high and bar.close > sma(closes, self.trend_filter) and a > 0:
+            return min(self.max_exposure, self.risk_per_trade / (self.stop_atr * a / bar.close))
+        return 0.0
+
+
+class JevStrategy(Strategy):
+    """Jev judges; deterministic gates here decide; the risk engine still has the last word.
+
+    Entry needs ALL of: setup_quality >= min_setup, direction long with confidence >= min_confidence,
+    calibrated p_long >= min_p_long, risk_state safe, regime not crisis, toxic_flow < max_toxic.
+    Exits need no confidence: abstain or crisis -> flat; risk_state reduce -> halve; a confident
+    short call -> flat. If a `brain` is attached, low confidence or crisis escalates to it, and it can
+    only pause new entries or flatten.
+    """
+
+    def __init__(self, engine=None, min_confidence: float = 0.80, min_p_long: float = 0.55,
+                 min_setup: float = 2.0, max_toxic: float = 0.5, horizon_bars: int = 4, cost_pct: float = 0.3,
+                 target_vol: float = 0.008, calibration=None, brain=None, escalate_below: float = 0.60,
                  on_decision=None):
-        from .jev import STATE_BARS, MockJev
+        from .jev import STATE_BARS, Calibration, MockJev
         self.engine = engine or MockJev()
-        self.min_confidence, self.min_p_up = min_confidence, min_p_up
-        self.horizon_bars, self.round_trip_cost_pct, self.target_vol = horizon_bars, round_trip_cost_pct, target_vol
-        self.on_decision = on_decision
-        self.last_decision = None
-        self.id = f"jev_c{min_confidence:.2f}_p{min_p_up:.2f}"
+        self.calibration = calibration or Calibration()
+        self.min_confidence, self.min_p_long, self.min_setup, self.max_toxic = min_confidence, min_p_long, min_setup, max_toxic
+        self.horizon_bars, self.cost_pct, self.target_vol = horizon_bars, cost_pct, target_vol
+        self.brain, self.escalate_below, self.on_decision = brain, escalate_below, on_decision
+        self.id = f"jev_c{min_confidence:.2f}_p{min_p_long:.2f}"
         self.warmup = STATE_BARS
+        self.account = None          # set by the caller each bar: dd_pct, day_pct, exposure
+        self.paused_until = 0        # bar open_time (ms) before which no new risk is taken
+        self.last_decision = self.last_p_cal = self.last_verdict = None
+        self.last_gates: list[str] = []
+
+    def entry_gates(self, d, p_cal) -> list[str]:
+        failed = []
+        if d.setup_quality < self.min_setup:
+            failed.append(f"setup {d.setup_quality:.2f}<{self.min_setup}")
+        if d.direction != "long":
+            failed.append(f"direction {d.direction}")
+        if d.direction_conf < self.min_confidence:
+            failed.append(f"confidence {d.direction_conf:.2f}<{self.min_confidence}")
+        if p_cal < self.min_p_long:
+            failed.append(f"p_long_cal {p_cal:.3f}<{self.min_p_long}")
+        if d.risk_state != "safe":
+            failed.append(f"risk_state {d.risk_state}")
+        if d.toxic_flow >= self.max_toxic:
+            failed.append(f"toxic {d.toxic_flow:.2f}")
+        return failed
 
     def target(self, history, current_exposure):
         from .jev import build_state
-        state = build_state(history, self.horizon_bars, self.round_trip_cost_pct)
+        now = history[-1].open_time
+        state = build_state(history, self.horizon_bars, self.cost_pct, self.account)
         d = self.engine.decide(state)
-        self.last_decision = d
+        p_cal = self.calibration.apply(d.p_long)
+        self.last_decision, self.last_p_cal, self.last_verdict, self.last_gates = d, p_cal, None, []
+        result = self._decide(history, current_exposure, now, state, d, p_cal)
         if self.on_decision:
-            self.on_decision(history[-1], d)
-        if d.regime == "crisis" or d.confidence < self.min_confidence or d.p_up < self.min_p_up:
+            self.on_decision(history[-1], d, p_cal, list(self.last_gates))
+        return result
+
+    def _decide(self, history, current_exposure, now, state, d, p_cal):
+
+        if self.brain and d.source == "jev" and now >= self.paused_until and \
+                (d.regime == "crisis" or d.confidence < self.escalate_below):
+            v = self.brain.review({"snapshot": state, "jev": d.to_dict(), "p_long_calibrated": p_cal,
+                                   "position_exposure": current_exposure})
+            self.last_verdict = v
+            if v.action in ("pause", "flatten"):
+                self.paused_until = now + max(v.pause_hours, 1) * 3_600_000
+            if v.action == "flatten":
+                return 0.0
+
+        if d.source == "abstain" or d.regime == "crisis":
+            self.last_gates = [f"exit: {d.source if d.source == 'abstain' else 'crisis'}"]
             return 0.0
-        vol = state["realized_vol_pct"]["last72"] / 100
+        if current_exposure > 0.01:
+            if d.risk_state == "reduce":
+                return current_exposure / 2
+            if d.direction == "short" and d.direction_conf >= self.min_confidence:
+                return 0.0
+            return current_exposure
+        if now < self.paused_until:
+            self.last_gates = ["paused by brain"]
+            return 0.0
+        self.last_gates = self.entry_gates(d, p_cal)
+        if self.last_gates:
+            return 0.0
+        vol = state["atr_pct"] / 100
         return 1.0 if vol == 0 else min(1.0, self.target_vol / vol)
 
 
@@ -117,5 +180,6 @@ STRATEGIES = {
     "buy_hold": BuyAndHold,
     "trend": TrendFollow,
     "meanrev": MeanReversion,
+    "donchian": Donchian,
     "jev": JevStrategy,
 }

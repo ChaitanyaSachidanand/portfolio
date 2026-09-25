@@ -1,4 +1,4 @@
-"""Command line: backtest, learn, calibrate, paper trade, kill switch, reports."""
+"""Command line: backtest, learn, review, paper trade, kill switch, reports."""
 from __future__ import annotations
 
 import argparse
@@ -8,16 +8,23 @@ import os
 from .backtest import run_backtest, stress_costs
 from .broker import CostModel
 from .data import INTERVAL_MS, fetch_recent, load_csv, load_or_fetch, synthetic
-from .paper import journal_calibration_pairs, load_state, report, run, save_state
+from .paper import load_state, report, run, save_state
 from .risk import RiskLimits
 from .strategies import STRATEGIES
 
 
-def make_strategy(name: str, jev_mode: str = "mock", params: dict | None = None, on_decision=None):
+def make_strategy(name: str, jev_mode: str = "mock", params: dict | None = None, on_decision=None,
+                  calibration_path: str = "calibration.json", brain: bool = False):
     params = dict(params or {})
     if name == "jev":
-        from .jev import JevClient, MockJev
+        from .jev import Calibration, JevClient, MockJev
         params["engine"] = JevClient() if jev_mode == "live" else MockJev()
+        params["calibration"] = Calibration.load(calibration_path)
+        if brain:
+            from .brain import Brain
+            params["brain"] = Brain()
+            if not params["brain"].available:
+                print("note: brain unavailable (pip install anthropic, set ANTHROPIC_API_KEY); escalations will pause")
         if on_decision:
             params["on_decision"] = on_decision
     return STRATEGIES[name](**params)
@@ -50,6 +57,7 @@ def main() -> None:
         sp.add_argument("--csv", help="use a saved CSV instead of downloading")
         sp.add_argument("--synthetic", action="store_true", help="offline fake data (tests the code, not the edge)")
         sp.add_argument("--registry", default="registry.json")
+        sp.add_argument("--calibration", default="calibration.json")
 
     bt = sub.add_parser("backtest", help="test a strategy on historical data")
     common(bt)
@@ -61,10 +69,12 @@ def main() -> None:
     ln.add_argument("--train-days", type=int, default=90)
     ln.add_argument("--test-days", type=int, default=30)
 
-    cb = sub.add_parser("calibrate", help="score Jev's probabilities against what happened (Brier)")
+    cb = sub.add_parser("review", help="nightly review: Brier, gate audit, propose a calibration refit")
     common(cb, days=180)
-    cb.add_argument("--journal", help="score the live paper journal instead of a replay")
+    cb.add_argument("--journal", help="review the paper journal (default: replay Jev over history)")
     cb.add_argument("--horizon-bars", type=int, default=4)
+
+    sub.add_parser("approve-calibration", help="promote the pending calibration from the last review")
 
     pp = sub.add_parser("paper", help="paper trade on live public data")
     common(pp)
@@ -72,6 +82,7 @@ def main() -> None:
     pp.add_argument("--poll", type=int, default=60)
     pp.add_argument("--state", default="paper_state.json")
     pp.add_argument("--journal", default="paper_journal.jsonl")
+    pp.add_argument("--brain", action="store_true", help="escalate low-confidence/crisis bars to Claude Opus 5.5")
 
     jp = sub.add_parser("jev-ping", help="send one real state to Jev and print the raw response")
     jp.add_argument("--symbol", default="BTCUSDT")
@@ -104,6 +115,10 @@ def main() -> None:
         save_state(a.state, state)
         print("halt cleared")
         return
+    if a.cmd == "approve-calibration":
+        from .review import approve
+        print(approve())
+        return
     if a.cmd == "report":
         print(report(a.journal, a.capital))
         return
@@ -112,10 +127,10 @@ def main() -> None:
         state = build_state(fetch_recent(a.symbol, a.interval, STATE_BARS + 2), 4, 0.3)
         body = JevClient().raw(state)
         print(json.dumps(body, indent=2))
-        print("\nparsed:", parse_answers(body, 0.0))
+        print("\nparsed:", parse_answers(body["answers"]))
         return
 
-    from .learn import Registry, calibration_report, walk_forward
+    from .learn import Registry, walk_forward
     limits = RiskLimits(max_daily_loss=a.max_daily_loss, max_drawdown=a.max_drawdown)
     bt_limits = RiskLimits(max_daily_loss=a.max_daily_loss, max_drawdown=a.max_drawdown, kill_file="")
     costs = CostModel(fee_rate=a.fee, slippage_bps=a.slippage_bps)
@@ -125,26 +140,27 @@ def main() -> None:
         champ = registry.champion(a.strategy)
         if not champ:
             print(f"note: no promoted parameters for {a.strategy}; using defaults (run `learn` first)")
-        strategy = make_strategy(a.strategy, a.jev, champ["params"] if champ else None)
+        strategy = make_strategy(a.strategy, a.jev, champ["params"] if champ else None,
+                                 calibration_path=a.calibration, brain=a.brain)
         print(f"paper trading {strategy.id} on {a.symbol} {a.interval} with ${a.capital} (simulated)")
         run(strategy, a.symbol, a.interval, a.capital, limits, costs, a.state,
             a.journal, a.once, a.poll)
         return
 
-    if a.cmd == "calibrate":
+    if a.cmd == "review":
+        from .review import Record, nightly, records_from_journal
         horizon_ms = a.horizon_bars * INTERVAL_MS[a.interval]
         if a.journal:
-            print(calibration_report(journal_calibration_pairs(a.journal, horizon_ms)))
-            return
-        from .learn import score_decisions
-        decisions = []
-        candles = get_candles(a)
-        s = make_strategy("jev", a.jev, {"horizon_bars": a.horizon_bars},
-                          on_decision=lambda bar, d: decisions.append((bar.open_time, bar.close, d.p_up)))
-        run_backtest(candles, s, a.capital, bt_limits, costs, a.interval)
-        closes = {c.open_time: c.close for c in candles}
-        print(f"replay on {len(candles)} candles{' (SYNTHETIC)' if a.synthetic else ''}, jev={a.jev}")
-        print(calibration_report(score_decisions(decisions, closes, horizon_ms)))
+            recs, closes = records_from_journal(a.journal)
+        else:
+            candles = get_candles(a)
+            recs = []
+            s = make_strategy("jev", a.jev, {"horizon_bars": a.horizon_bars}, calibration_path=a.calibration,
+                              on_decision=lambda bar, d, p, gates: recs.append(Record(bar.open_time, bar.close, d.p_long, p, gates)))
+            run_backtest(candles, s, a.capital, bt_limits, costs, a.interval)
+            closes = {c.open_time: c.close for c in candles}
+            print(f"replay on {len(candles)} candles{' (SYNTHETIC)' if a.synthetic else ''}, jev={a.jev}\n")
+        print(nightly(recs, closes, horizon_ms, a.calibration))
         return
 
     candles = get_candles(a)

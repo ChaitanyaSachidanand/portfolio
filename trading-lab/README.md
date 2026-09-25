@@ -19,16 +19,26 @@ real costs, then paper trade them 24/7 behind hard risk limits.
 ```
 trading_lab/
   data.py        Binance public klines (GET /api/v3/klines, no key), CSV cache, synthetic data
-  strategies.py  Strategy -> target exposure in [0, 1]. trend, meanrev, buy_hold baseline
+  strategies.py  Strategy -> target exposure in [0, 1]. donchian, jev, trend, meanrev, buy_hold baseline
   risk.py        Deterministic risk engine: kill switch, max drawdown (latching), daily loss, no leverage
   broker.py      Paper broker: fees, slippage, min order size, rebalance band
   backtest.py    Decide on bar close, fill at next bar open (no lookahead); metrics; cost stress test
   paper.py       24/7 loop: strategy -> risk -> simulated fill, JSON state, JSONL journal
-  jev.py         Jev (TypeSafe AI) client + offline MockJev: typed regime/direction judgments
-  learn.py       Walk-forward search, champion/challenger registry, Brier calibration
+  strategies_math.py  SMA, RSI, ATR, realized vol
+  jev.py         Jev (TypeSafe AI): 5 typed questions, strict parsing, fail-closed abstain, MockJev, Calibration
+  brain.py       Claude Opus 5.5 escalation desk: can only no_change / pause / flatten; fails closed to pause
+  learn.py       Walk-forward search, champion/challenger registry, Brier scoring
+  review.py      Nightly review: Brier, gate audit, calibration refit written as pending
   cli.py         Command line
 tests/           python -m unittest discover -s tests
+docs/RESEARCH.md what the viral post, the prompt and the public builds actually show (with sources)
 ```
+
+**Start with [docs/RESEARCH.md](docs/RESEARCH.md).** In short: the prompt in the screenshot comes from
+@RohOnChain, who also promotes AgenKit. The one public build of it reports −2.10% in its backtest and has
+never traded real money, and no Jev trading project has shown profit. The only small-account system found
+with checkable numbers is a Japanese developer's daily Donchian breakout (≈ buy-and-hold returns with half the
+drawdown, +9%/yr out-of-sample). That's the `donchian` strategy here.
 
 Pipeline for every decision: **data → strategy (proposes) → risk engine (disposes) → broker**.
 Strategies can't size orders or bypass risk; the risk engine is plain code with no overrides.
@@ -58,27 +68,52 @@ python -m trading_lab unkill
 python -m trading_lab reset-halt
 ```
 
-## Jev as the decision engine
+## Strategies
 
-`--strategy jev` asks Jev two typed questions each bar: **regime** (trending / mean_reverting / high_vol /
-crisis) and **direction** (up / down_or_flat, with probabilities and confidence). Deterministic gates then
-decide: no position in `crisis`, none if confidence < `min_confidence` (default 0.60) or p_up < `min_p_up`.
-Jev never sizes or places anything, and the risk engine still has the final say.
+| Strategy | Idea | Interval |
+|---|---|---|
+| `donchian` | Breakout above the 20-bar high with a 50-bar trend filter; exit on the 10-bar low or an ATR trail; 1% risk per trade, max 40% exposure | `1d` |
+| `jev` | Jev's five typed answers go through deterministic gates (below) | `1h` |
+| `trend`, `meanrev` | Moving-average trend and RSI dip-buying, for comparison | `1h` |
+| `buy_hold` | Baseline: every strategy is judged against it | any |
 
 ```bash
-export TYPESAFE_API_KEY=...        # from typesafe.ai
-python -m trading_lab jev-ping                         # 1 real call: check the response format parses
-python -m trading_lab paper --strategy jev --jev live  # hourly Jev decisions, paper fills
-python -m trading_lab calibrate --journal paper_journal.jsonl   # were Jev's probabilities any good?
+python -m trading_lab backtest --strategy donchian --interval 1d --days 1460
 ```
 
-Without `--jev live` a `MockJev` heuristic stands in so everything runs offline. The raw-HTTP request
-format in `jev.py` follows the public jev-trader project and TypeSafe's documented endpoint, but could not
-be verified end-to-end when this was written: run `jev-ping` first.
+With $30, 1% risk per trade works out to orders of about $5, right at typical exchange minimums.
+
+## Jev as the decision engine
+
+Each bar, one request asks Jev five typed questions: **regime** (trending / mean_reverting / high_vol / crisis),
+**direction** (long / short / neutral), **toxic_flow** (probability), **setup_quality** (0–3) and **risk_state**
+(safe / near_limit / reduce). Code then decides:
+
+- **Enter** only if setup ≥ 2, direction long with confidence ≥ 0.80, *calibrated* p_long ≥ 0.55, risk_state
+  safe, regime not crisis, and toxic_flow < 0.5.
+- **Exit** without needing confidence: Jev unavailable or malformed → flat; crisis → flat; reduce → halve;
+  confident short call → flat.
+- **Escalate** (optional, `--brain`): if confidence < 0.60 or regime is crisis, Claude Opus 5.5 reviews the bar
+  and can only answer `no_change`, `pause` (no new entries for N hours) or `flatten`. Any failure means pause.
+
+Size is volatility-scaled and the risk engine still has the final say.
+
+```bash
+export TYPESAFE_API_KEY=...        # console.typesafe.ai
+python -m trading_lab jev-ping     # 1 real call: confirm the response parses
+python -m trading_lab paper --strategy jev --jev live
+pip install anthropic && export ANTHROPIC_API_KEY=...          # optional brain
+python -m trading_lab paper --strategy jev --jev live --brain
+```
+
+Without `--jev live` a `MockJev` heuristic with the same answer format stands in, so everything runs offline.
+The wire format follows TypeSafe's docs as cited by the public build it's based on, but couldn't be fetched
+directly when this was written: run `jev-ping` first. Pin a version with `JEV_MODEL=...` once you tune thresholds.
 
 ## Self-learning (controlled)
 
 ```bash
+python -m trading_lab learn --strategy donchian --interval 1d --days 1460 --train-days 730 --test-days 180
 python -m trading_lab learn --strategy trend --days 365      # also: meanrev, jev (mock only)
 python -m trading_lab backtest --strategy trend --champion   # backtest the promoted parameters
 ```
@@ -89,16 +124,19 @@ python -m trading_lab backtest --strategy trend --champion   # backtest the prom
   inside the limit, it has some edge over buy-and-hold, and it beats the current champion's Sharpe.
   Every attempt, including rejections, goes to `learn_log.jsonl`.
 - `paper` automatically uses the promoted parameters.
-- `calibrate` scores Jev's p_up against what happened (Brier score vs. guessing the base rate). If Jev
-  isn't beating the base rate on your journal, its "confidence" means nothing and you should not trade it.
+- `review --journal paper_journal.jsonl` (nightly) scores every Jev p_long against what happened (Brier vs.
+  guessing the base rate), audits each gate (winners missed vs. losers avoided), and refits the calibration
+  map (monotone, shrunk toward 0.5 until there are enough samples). The refit is written to
+  `calibration.pending.json`; you promote it with `approve-calibration`. If Jev isn't beating the base rate on
+  your journal, its confidence means nothing and it should not get money.
 - Learning never changes risk limits.
 
 ## Daily loop (cron)
 
 ```cron
 5 * * * *  cd ~/portfolio/trading-lab && python -m trading_lab paper --strategy jev --jev live --once
-0 3 * * 0  cd ~/portfolio/trading-lab && python -m trading_lab learn --strategy trend && python -m trading_lab learn --strategy meanrev
-30 3 * * * cd ~/portfolio/trading-lab && python -m trading_lab calibrate --journal paper_journal.jsonl && python -m trading_lab report
+0 3 * * 0  cd ~/portfolio/trading-lab && python -m trading_lab learn --strategy donchian --interval 1d --days 1460 --train-days 730 --test-days 180
+30 3 * * * cd ~/portfolio/trading-lab && python -m trading_lab review --journal paper_journal.jsonl && python -m trading_lab report
 ```
 
 ## About Elefin
