@@ -14,7 +14,7 @@ from datetime import datetime, timezone
 
 from .backtest import utc_day
 from .broker import CostModel, PaperBroker
-from .data import INTERVAL_MS, fetch_recent
+from .data import INTERVAL_MS, fetch_recent, fetch_ticker
 from .risk import RiskEngine, RiskLimits
 from .strategies import Strategy
 
@@ -40,9 +40,9 @@ def journal(path: str, record: dict) -> None:
 
 
 def step(strategy: Strategy, symbol: str, interval: str, state: dict, limits: RiskLimits,
-         costs: CostModel, journal_path: str, fetch=fetch_recent) -> dict:
+         costs: CostModel, journal_path: str, fetch=fetch_recent, now_ms: int | None = None) -> dict:
     """Process at most one new closed bar. Returns the updated state."""
-    now_ms = int(time.time() * 1000)
+    now_ms = now_ms if now_ms is not None else int(time.time() * 1000)
     candles = fetch(symbol, interval, strategy.warmup + 5)
     if len(candles) <= strategy.warmup:
         raise RuntimeError(f"only {len(candles)} candles returned; need {strategy.warmup + 1}")
@@ -100,18 +100,36 @@ def step(strategy: Strategy, symbol: str, interval: str, state: dict, limits: Ri
 
 def run(strategy: Strategy, symbol: str, interval: str, capital: float, limits: RiskLimits,
         costs: CostModel, state_path: str, journal_path: str, once: bool = False,
-        poll_seconds: int = 60) -> None:
+        poll_seconds: float = 60, fetch=fetch_recent, ticker=fetch_ticker, clock=None,
+        quiet: bool = False, stop=None, mode: str = "live data") -> None:
+    """Paper loop. `fetch`, `ticker` and `clock` are swappable so the same loop drives replays."""
     state = load_state(state_path, capital)
-    while True:
+    state.update(strategy_id=strategy.id, symbol=symbol, interval=interval, capital=capital, mode=mode,
+                 started=state.get("started") or int(time.time() * 1000),
+                 limits={"max_daily_loss": limits.max_daily_loss, "max_drawdown": limits.max_drawdown})
+    while stop is None or not stop.is_set():
+        now_ms = clock() if clock else int(time.time() * 1000)
         try:
-            state = step(strategy, symbol, interval, state, limits, costs, journal_path)
-            save_state(state_path, state)
+            state = step(strategy, symbol, interval, state, limits, costs, journal_path, fetch, now_ms)
+            state["last_ok"] = int(time.time() * 1000)
+            state.pop("last_error", None)
         except Exception as exc:  # network/exchange failure: log, keep the old state, try again
-            journal(journal_path, {"ts": int(time.time() * 1000), "event": "error", "error": repr(exc)})
-            print(f"{datetime.now(timezone.utc):%H:%M:%S} error: {exc!r}")
+            state["last_error"] = repr(exc)[:200]
+            journal(journal_path, {"ts": now_ms, "event": "error", "error": repr(exc)})
+            if not quiet:
+                print(f"{datetime.now(timezone.utc):%H:%M:%S} error: {exc!r}")
+        try:
+            state["mark"], state["mark_ts"] = ticker(symbol), int(time.time() * 1000)
+        except Exception:
+            pass  # the dashboard shows the mark's age; a stale mark is visible, not hidden
+        state["kill"] = os.path.exists(limits.kill_file) if limits.kill_file else False
+        save_state(state_path, state)
         if once:
             return
-        time.sleep(poll_seconds)
+        if stop is not None:
+            stop.wait(poll_seconds)
+        else:
+            time.sleep(poll_seconds)
 
 
 def report(journal_path: str, capital: float) -> str:

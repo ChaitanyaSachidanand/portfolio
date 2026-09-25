@@ -7,3 +7,6 @@ registry.json
 learn_log.jsonl
 calibration.json
 calibration.pending.json
+replay_state.json*
+replay_journal.jsonl
+*.html

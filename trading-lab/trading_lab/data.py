@@ -11,8 +11,12 @@ import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 
-# Documented public endpoint: GET /api/v3/klines (max 1000 rows per request).
-BINANCE_KLINES = "https://api.binance.com/api/v3/klines"
+# Documented public endpoints: GET /api/v3/klines (max 1000 rows) and GET /api/v3/ticker/price.
+# Binance.com blocks some countries (including the US); set TRADING_LAB_BINANCE=https://api.binance.us,
+# which serves the same endpoints for its own markets.
+BINANCE_BASE = os.environ.get("TRADING_LAB_BINANCE", "https://api.binance.com").rstrip("/")
+BINANCE_KLINES = f"{BINANCE_BASE}/api/v3/klines"
+BINANCE_TICKER = f"{BINANCE_BASE}/api/v3/ticker/price"
 
 INTERVAL_MS = {
     "1m": 60_000,
@@ -58,6 +62,13 @@ def fetch_klines(symbol: str, interval: str, start_ms: int, end_ms: int) -> list
     return out
 
 
+def fetch_ticker(symbol: str) -> float:
+    """Latest trade price, for marking the paper account between closed bars."""
+    query = urllib.parse.urlencode({"symbol": symbol})
+    with urllib.request.urlopen(f"{BINANCE_TICKER}?{query}", timeout=10) as resp:
+        return float(json.load(resp)["price"])
+
+
 def fetch_recent(symbol: str, interval: str, bars: int) -> list[Candle]:
     step = INTERVAL_MS[interval]
     end = int(time.time() * 1000)
@@ -90,6 +101,35 @@ def load_or_fetch(symbol: str, interval: str, days: int, cache_dir: str = "data"
     candles = fetch_klines(symbol, interval, end - days * 86_400_000, end)
     save_csv(path, candles)
     return candles
+
+
+class ReplayFeed:
+    """Plays synthetic candles as if they were arriving live: one new closed bar per `seconds_per_bar`.
+
+    For demos and testing the dashboard offline. Everything it produces is labeled SIMULATED.
+    """
+
+    def __init__(self, candles: list[Candle], start_index: int, seconds_per_bar: float, interval: str):
+        self.candles, self.start, self.speed = candles, start_index, seconds_per_bar
+        self.step_ms = INTERVAL_MS[interval]
+        self.t0 = time.time()
+
+    def index(self) -> int:
+        return min(self.start + int((time.time() - self.t0) / self.speed), len(self.candles) - 1)
+
+    def now_ms(self) -> int:
+        """Simulated clock: one minute after the latest bar closed."""
+        return self.candles[self.index()].open_time + self.step_ms + 60_000
+
+    def fetch(self, symbol: str, interval: str, bars: int) -> list[Candle]:
+        i = self.index()
+        return self.candles[max(0, i + 1 - bars): i + 1]
+
+    def ticker(self, symbol: str) -> float:
+        c = self.candles[self.index()]
+        frac = ((time.time() - self.t0) / self.speed) % 1.0
+        nxt = self.candles[min(self.index() + 1, len(self.candles) - 1)]
+        return c.close + (nxt.open - c.close) * frac
 
 
 def synthetic(bars: int, interval: str = "1h", seed: int = 7, start_price: float = 60_000.0) -> list[Candle]:

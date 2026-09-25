@@ -68,6 +68,26 @@ python -m trading_lab unkill
 python -m trading_lab reset-halt
 ```
 
+## Watch it live (terminal dashboard)
+
+```bash
+python -m trading_lab live --strategy jev                  # paper trader + dashboard, real Binance data
+python -m trading_lab live --strategy trend --replay       # offline demo on SIMULATED candles
+python -m trading_lab paper --strategy jev &               # or run the trader separately...
+python -m trading_lab watch                                # ...and attach the dashboard any time
+python -m trading_lab watch --snapshot now.html            # save one frame as HTML
+```
+
+![dashboard](docs/dashboard.png)
+
+Panels: live price and sparkline, account (equity, cash, position, exposure, drawdown and daily-loss bars
+against their limits, fees), the latest decision (Jev's regime, direction probabilities, calibrated p_long,
+setup, toxic flow, risk state, and exactly which gate blocked the trade), recent trades, and events. The badge
+turns yellow or red for stale data, a brain pause, a drawdown halt or the kill switch. `q` quits;
+the trader keeps running if it was started separately.
+
+In the US, set `TRADING_LAB_BINANCE=https://api.binance.us` (Binance.com blocks US users).
+
 ## Strategies
 
 | Strategy | Idea | Interval |

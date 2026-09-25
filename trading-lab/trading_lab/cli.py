@@ -84,6 +84,23 @@ def main() -> None:
     pp.add_argument("--journal", default="paper_journal.jsonl")
     pp.add_argument("--brain", action="store_true", help="escalate low-confidence/crisis bars to Claude Opus 5.5")
 
+    lv = sub.add_parser("live", help="paper trader + live dashboard in one terminal")
+    common(lv)
+    lv.add_argument("--poll", type=float, default=60)
+    lv.add_argument("--state", default="paper_state.json")
+    lv.add_argument("--journal", default="paper_journal.jsonl")
+    lv.add_argument("--brain", action="store_true")
+    lv.add_argument("--replay", action="store_true",
+                    help="SIMULATED: play synthetic candles as if live (offline demo; separate state files)")
+    lv.add_argument("--seconds-per-bar", type=float, default=2.0, help="replay speed")
+
+    wt = sub.add_parser("watch", help="dashboard for a running paper trader")
+    wt.add_argument("--state", default="paper_state.json")
+    wt.add_argument("--journal", default="paper_journal.jsonl")
+    wt.add_argument("--once", action="store_true", help="print one frame and exit")
+    wt.add_argument("--snapshot", help="write one frame as an HTML file")
+    wt.add_argument("--width", type=int, default=0)
+
     jp = sub.add_parser("jev-ping", help="send one real state to Jev and print the raw response")
     jp.add_argument("--symbol", default="BTCUSDT")
     jp.add_argument("--interval", choices=sorted(INTERVAL_MS), default="1h")
@@ -119,6 +136,21 @@ def main() -> None:
         from .review import approve
         print(approve())
         return
+    if a.cmd == "watch":
+        from . import dashboard
+        if a.once or a.snapshot:
+            state, rows = dashboard.load(a.state, a.journal)
+            width = a.width or (os.get_terminal_size(0).columns if os.isatty(0) else 120)
+            lines = dashboard.frame(state, rows, width)
+            if a.snapshot:
+                with open(a.snapshot, "w") as f:
+                    f.write(dashboard.to_html(lines))
+                print(f"wrote {a.snapshot}")
+            else:
+                print(dashboard.to_ansi(lines))
+        else:
+            dashboard.watch(a.state, a.journal)
+        return
     if a.cmd == "report":
         print(report(a.journal, a.capital))
         return
@@ -145,6 +177,36 @@ def main() -> None:
         print(f"paper trading {strategy.id} on {a.symbol} {a.interval} with ${a.capital} (simulated)")
         run(strategy, a.symbol, a.interval, a.capital, limits, costs, a.state,
             a.journal, a.once, a.poll)
+        return
+
+    if a.cmd == "live":
+        import threading
+        from . import dashboard
+        from .data import ReplayFeed, fetch_recent, fetch_ticker
+        champ = registry.champion(a.strategy)
+        strategy = make_strategy(a.strategy, a.jev, champ["params"] if champ else None,
+                                 calibration_path=a.calibration, brain=a.brain)
+        kwargs = dict(fetch=fetch_recent, ticker=fetch_ticker, clock=None, mode="live data")
+        state_path, journal_path, poll = a.state, a.journal, a.poll
+        if a.replay:
+            state_path, journal_path = "replay_state.json", "replay_journal.jsonl"
+            for p in (state_path, journal_path):
+                if os.path.exists(p):
+                    os.remove(p)
+            candles = synthetic(max(a.days, 30) * 86_400_000 // INTERVAL_MS[a.interval], a.interval)
+            feed = ReplayFeed(candles, strategy.warmup + 5, a.seconds_per_bar, a.interval)
+            kwargs = dict(fetch=feed.fetch, ticker=feed.ticker, clock=feed.now_ms, mode="SIMULATED REPLAY")
+            poll = min(a.seconds_per_bar / 2, 1.0)
+        stop = threading.Event()
+        t = threading.Thread(target=run, daemon=True, args=(strategy, a.symbol, a.interval, a.capital, limits, costs,
+                                                            state_path, journal_path),
+                             kwargs=dict(poll_seconds=poll, quiet=True, stop=stop, **kwargs))
+        t.start()
+        try:
+            dashboard.watch(state_path, journal_path)
+        finally:
+            stop.set()
+        print(report(journal_path, a.capital))
         return
 
     if a.cmd == "review":

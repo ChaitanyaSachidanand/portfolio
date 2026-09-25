@@ -309,3 +309,47 @@ class ReviewTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+from trading_lab import dashboard
+from trading_lab.data import ReplayFeed
+
+
+class DashboardTests(unittest.TestCase):
+    def test_renders_empty_and_populated(self):
+        empty = dashboard.frame({}, [], 120)
+        self.assertIn("WAITING", "".join(t for t, _ in empty[0]))
+        with tempfile.TemporaryDirectory() as d:
+            j = os.path.join(d, "j.jsonl")
+            s = STRATEGIES["jev"](min_confidence=0.3, min_p_long=0.5)
+            feed = ReplayFeed(synthetic(400), s.warmup + 5, 0.001, "1h")
+            state = load_state(os.path.join(d, "s.json"), 30.0)
+            for _ in range(50):
+                feed.t0 -= 0.001
+                state = step(s, "BTCUSDT", "1h", state, RiskLimits(kill_file=""), CostModel(), j,
+                             fetch=feed.fetch, now_ms=feed.now_ms())
+            now = state["last_bar"] + 3_600_000 + 60_000
+            state.update(symbol="BTCUSDT", interval="1h", capital=30.0, last_ok=now)
+            _, rows = dashboard.load(os.path.join(d, "none.json"), j)
+            self.assertGreater(len(rows), 10)
+            for width in (70, 120, 200):
+                lines = dashboard.frame(state, rows, width, now_ms=now)
+                text = "\n".join("".join(t for t, _ in ln) for ln in lines)
+                self.assertIn("DECISION", text)
+                self.assertIn("RUNNING", text)
+                self.assertTrue(all(dashboard.seg_len(ln) <= max(width, 60) + 1 for ln in lines), width)
+            self.assertIn("<pre", dashboard.to_html(lines))
+
+    def test_status_priorities(self):
+        now = 10_000_000
+        self.assertEqual(dashboard.status({"kill": True, "halted": True, "last_ok": now}, now)[0], "KILL SWITCH ON")
+        self.assertIn("HALTED", dashboard.status({"halted": True, "last_ok": now}, now)[0])
+        self.assertIn("STALE", dashboard.status({"last_ok": 0}, now)[0])
+        self.assertEqual(dashboard.status({"last_ok": now}, now)[0], "RUNNING")
+
+    def test_tail_lines(self):
+        with tempfile.TemporaryDirectory() as d:
+            p = os.path.join(d, "x")
+            with open(p, "w") as f:
+                f.write("".join(f"{i}\n" for i in range(100_000)))
+            self.assertEqual(dashboard.tail_lines(p, 3), ["99997", "99998", "99999"])
