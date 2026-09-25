@@ -110,3 +110,83 @@ class PaperTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+import math
+import random
+
+from trading_lab.jev import MockJev, build_state, parse_answers
+from trading_lab.learn import Registry, WalkForward, brier, calibration_report, walk_forward
+from trading_lab.strategies import JevStrategy
+
+
+def trending(bars, seed=1):
+    rng, price, out = random.Random(seed), 100.0, []
+    for i in range(bars):
+        c = price * math.exp(rng.gauss(0.002, 0.004))
+        out.append(Candle(i * 3_600_000, price, max(price, c), min(price, c), c, 1))
+        price = c
+    return out
+
+
+class LearnTests(unittest.TestCase):
+    def test_walk_forward_promotes_a_real_edge(self):
+        with tempfile.TemporaryDirectory() as d:
+            reg = Registry(os.path.join(d, "r.json"), os.path.join(d, "l.jsonl"))
+            wf = walk_forward("trend", trending(24 * 120), 24 * 40, 24 * 20)
+            self.assertGreater(wf.oos_return, 0)
+            ok, why = reg.consider(wf, RiskLimits())
+            self.assertTrue(ok, why)
+            self.assertEqual(reg.champion("trend")["version"], 1)
+            # Same result again does not beat the champion by the required margin.
+            ok, _ = reg.consider(wf, RiskLimits())
+            self.assertFalse(ok)
+            self.assertEqual(Registry(os.path.join(d, "r.json")).champion("trend")["version"], 1)
+
+    def test_losing_challenger_rejected(self):
+        with tempfile.TemporaryDirectory() as d:
+            reg = Registry(os.path.join(d, "r.json"), os.path.join(d, "l.jsonl"))
+            wf = WalkForward("trend", 3, -0.1, -0.2, 0.15, -1.0, [], {"fast": 10, "slow": 100})
+            ok, why = reg.consider(wf, RiskLimits())
+            self.assertFalse(ok)
+            self.assertIsNone(reg.champion("trend"))
+            with open(os.path.join(d, "l.jsonl")) as f:
+                self.assertIn("rejected", f.read())
+
+    def test_brier_and_calibration(self):
+        perfect = [(1.0, 1), (0.0, 0)] * 20
+        self.assertEqual(brier(perfect), 0.0)
+        self.assertIn("better than guessing", calibration_report(perfect))
+        self.assertIn("NOT better", calibration_report([(0.9, 0), (0.1, 1)] * 20))
+
+
+class JevTests(unittest.TestCase):
+    def test_parse_answers_with_and_without_confidence(self):
+        body = {"answers": {"regime": {"choice": "trending", "probabilities": {"trending": 0.7, "crisis": 0.3}},
+                            "direction": {"choice": "up", "probabilities": {"up": 0.8, "down_or_flat": 0.2},
+                                          "confidence": 0.65}}}
+        d = parse_answers(body, 12.0)
+        self.assertEqual((d.regime, d.direction, d.p_up, d.confidence), ("trending", "up", 0.8, 0.65))
+        del body["answers"]["direction"]["confidence"]
+        self.assertTrue(0 < parse_answers(body, 0).confidence < 1)
+
+    def test_crisis_or_low_confidence_blocks_trade(self):
+        class Fixed:
+            def __init__(self, regime, p, conf):
+                self.d = parse_answers({"regime": {"choice": regime},
+                                        "direction": {"choice": "up", "probabilities": {"up": p, "down_or_flat": 1 - p},
+                                                      "confidence": conf}}, 0)
+
+            def decide(self, state):
+                return self.d
+
+        hist = trending(200)
+        self.assertEqual(JevStrategy(Fixed("crisis", 0.9, 0.9)).target(hist, 0), 0.0)
+        self.assertEqual(JevStrategy(Fixed("trending", 0.9, 0.3)).target(hist, 0), 0.0)
+        self.assertGreater(JevStrategy(Fixed("trending", 0.9, 0.9)).target(hist, 0), 0.0)
+
+    def test_state_is_compact_and_mock_runs(self):
+        state = build_state(synthetic(200), 4, 0.3)
+        self.assertLess(len(str(state)), 800)
+        d = MockJev().decide(state)
+        self.assertTrue(0 <= d.p_up <= 1)

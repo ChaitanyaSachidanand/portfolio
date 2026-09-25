@@ -24,6 +24,8 @@ trading_lab/
   broker.py      Paper broker: fees, slippage, min order size, rebalance band
   backtest.py    Decide on bar close, fill at next bar open (no lookahead); metrics; cost stress test
   paper.py       24/7 loop: strategy -> risk -> simulated fill, JSON state, JSONL journal
+  jev.py         Jev (TypeSafe AI) client + offline MockJev: typed regime/direction judgments
+  learn.py       Walk-forward search, champion/challenger registry, Brier calibration
   cli.py         Command line
 tests/           python -m unittest discover -s tests
 ```
@@ -55,6 +57,57 @@ python -m trading_lab unkill
 # After a max-drawdown halt, read the journal, understand why, then:
 python -m trading_lab reset-halt
 ```
+
+## Jev as the decision engine
+
+`--strategy jev` asks Jev two typed questions each bar: **regime** (trending / mean_reverting / high_vol /
+crisis) and **direction** (up / down_or_flat, with probabilities and confidence). Deterministic gates then
+decide: no position in `crisis`, none if confidence < `min_confidence` (default 0.60) or p_up < `min_p_up`.
+Jev never sizes or places anything, and the risk engine still has the final say.
+
+```bash
+export TYPESAFE_API_KEY=...        # from typesafe.ai
+python -m trading_lab jev-ping                         # 1 real call: check the response format parses
+python -m trading_lab paper --strategy jev --jev live  # hourly Jev decisions, paper fills
+python -m trading_lab calibrate --journal paper_journal.jsonl   # were Jev's probabilities any good?
+```
+
+Without `--jev live` a `MockJev` heuristic stands in so everything runs offline. The raw-HTTP request
+format in `jev.py` follows the public jev-trader project and TypeSafe's documented endpoint, but could not
+be verified end-to-end when this was written: run `jev-ping` first.
+
+## Self-learning (controlled)
+
+```bash
+python -m trading_lab learn --strategy trend --days 365      # also: meanrev, jev (mock only)
+python -m trading_lab backtest --strategy trend --champion   # backtest the promoted parameters
+```
+
+- `learn` does a walk-forward search: choose parameters on 90 days, score them on the *next* 30 days
+  they were never tuned on, roll forward. Scoring always uses stressed costs.
+- A challenger is promoted to `registry.json` only if its out-of-sample return is positive, its drawdown is
+  inside the limit, it has some edge over buy-and-hold, and it beats the current champion's Sharpe.
+  Every attempt, including rejections, goes to `learn_log.jsonl`.
+- `paper` automatically uses the promoted parameters.
+- `calibrate` scores Jev's p_up against what happened (Brier score vs. guessing the base rate). If Jev
+  isn't beating the base rate on your journal, its "confidence" means nothing and you should not trade it.
+- Learning never changes risk limits.
+
+## Daily loop (cron)
+
+```cron
+5 * * * *  cd ~/portfolio/trading-lab && python -m trading_lab paper --strategy jev --jev live --once
+0 3 * * 0  cd ~/portfolio/trading-lab && python -m trading_lab learn --strategy trend && python -m trading_lab learn --strategy meanrev
+30 3 * * * cd ~/portfolio/trading-lab && python -m trading_lab calibrate --journal paper_journal.jsonl && python -m trading_lab report
+```
+
+## About Elefin
+
+Not supported, on purpose. As of Sept 2026 Elefin is an offshore CFD broker registered in Saint Lucia, offering
+leverage up to 1:2000, and at least one broker-review site lists it as a suspicious broker, with concerns about
+withdrawals. CFDs mean you never own the coin, and at 1:2000 a 0.05% move wipes out the account. Its Standard
+account also needs a $50 minimum. If a strategy here ever graduates, use a large, regulated spot exchange
+available in your country.
 
 Every backtest also runs a **stress test** (2x fees, 3x slippage). If the edge disappears there, there
 is no edge.

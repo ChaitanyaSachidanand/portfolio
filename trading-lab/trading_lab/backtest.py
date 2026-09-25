@@ -71,7 +71,8 @@ def run_backtest(
         if utc_day(bar.open_time) != day:
             day, day_start = utc_day(bar.open_time), equity
 
-        raw = strategy.target(candles[: i + 1], broker.exposure(bar.close))
+        window = candles[max(0, i - strategy.warmup - 1): i + 1]
+        raw = strategy.target(window, broker.exposure(bar.close))
         decision = risk.check(raw, equity, peak, day_start)
         for reason in decision.reasons:
             key = reason.split("_from_")[0]

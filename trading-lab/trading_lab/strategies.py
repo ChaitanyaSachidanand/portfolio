@@ -81,8 +81,41 @@ class MeanReversion(Strategy):
         return 0.5 if value <= self.entry and in_uptrend else 0.0
 
 
+class JevStrategy(Strategy):
+    """Jev judges regime and direction; deterministic gates here decide whether that is enough.
+
+    Gates (from the fund prompt): no position in a crisis regime, and none unless Jev's confidence
+    is at least `min_confidence` and p_up clears `min_p_up`. Size is volatility-scaled like TrendFollow.
+    """
+
+    def __init__(self, engine=None, min_confidence: float = 0.60, min_p_up: float = 0.55,
+                 horizon_bars: int = 4, round_trip_cost_pct: float = 0.3, target_vol: float = 0.008,
+                 on_decision=None):
+        from .jev import STATE_BARS, MockJev
+        self.engine = engine or MockJev()
+        self.min_confidence, self.min_p_up = min_confidence, min_p_up
+        self.horizon_bars, self.round_trip_cost_pct, self.target_vol = horizon_bars, round_trip_cost_pct, target_vol
+        self.on_decision = on_decision
+        self.last_decision = None
+        self.id = f"jev_c{min_confidence:.2f}_p{min_p_up:.2f}"
+        self.warmup = STATE_BARS
+
+    def target(self, history, current_exposure):
+        from .jev import build_state
+        state = build_state(history, self.horizon_bars, self.round_trip_cost_pct)
+        d = self.engine.decide(state)
+        self.last_decision = d
+        if self.on_decision:
+            self.on_decision(history[-1], d)
+        if d.regime == "crisis" or d.confidence < self.min_confidence or d.p_up < self.min_p_up:
+            return 0.0
+        vol = state["realized_vol_pct"]["last72"] / 100
+        return 1.0 if vol == 0 else min(1.0, self.target_vol / vol)
+
+
 STRATEGIES = {
     "buy_hold": BuyAndHold,
     "trend": TrendFollow,
     "meanrev": MeanReversion,
+    "jev": JevStrategy,
 }

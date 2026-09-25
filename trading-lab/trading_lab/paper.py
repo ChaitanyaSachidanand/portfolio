@@ -67,6 +67,7 @@ def step(strategy: Strategy, symbol: str, interval: str, state: dict, limits: Ri
     # Paper approximation: fill at the just-closed price plus slippage.
     fill = broker.rebalance(decision.approved, bar.close)
 
+    jev = getattr(strategy, "last_decision", None)
     journal(journal_path, {
         "ts": now_ms,
         "decision_id": str(uuid.uuid4()),
@@ -78,6 +79,7 @@ def step(strategy: Strategy, symbol: str, interval: str, state: dict, limits: Ri
         "approved_target": decision.approved,
         "risk_reasons": decision.reasons,
         "fill": asdict(fill) if fill else None,
+        "jev": asdict(jev) if jev else None,
         "equity": broker.equity(bar.close),
     })
     state.update(cash=broker.cash, qty=broker.qty, halted=risk.halted,
@@ -99,6 +101,17 @@ def run(strategy: Strategy, symbol: str, interval: str, capital: float, limits: 
         if once:
             return
         time.sleep(poll_seconds)
+
+
+def journal_calibration_pairs(journal_path: str, horizon_ms: int) -> list[tuple[float, int]]:
+    """Score every journaled Jev p_up against the close `horizon_ms` later."""
+    from .learn import score_decisions
+    with open(journal_path) as f:
+        rows = [json.loads(line) for line in f if line.strip()]
+    rows = [r for r in rows if "decision_id" in r]
+    closes = {r["bar_open_time"]: r["close"] for r in rows}
+    decisions = [(r["bar_open_time"], r["close"], r["jev"]["p_up"]) for r in rows if r.get("jev")]
+    return score_decisions(decisions, closes, horizon_ms)
 
 
 def report(journal_path: str, capital: float) -> str:

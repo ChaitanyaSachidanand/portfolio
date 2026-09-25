@@ -3,3 +3,5 @@ data/
 paper_state.json*
 paper_journal.jsonl
 KILL
+registry.json
+learn_log.jsonl
