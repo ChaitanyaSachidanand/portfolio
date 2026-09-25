@@ -99,6 +99,17 @@ def seg_len(line: Line) -> int:
     return sum(len(t) for t, _ in line)
 
 
+def clip(line: Line, width: int) -> Line:
+    out, used = [], 0
+    for text, style in line:
+        if used >= width:
+            break
+        text = text[: width - used]
+        out.append((text, style))
+        used += len(text)
+    return out
+
+
 def box(title: str, body: list[Line], width: int) -> list[Line]:
     inner = width - 4
     out = [[("┌─ ", "dim"), (title, "title"), (" " + "─" * max(0, width - len(title) - 5) + "┐", "dim")]]
@@ -153,11 +164,11 @@ def frame(state: dict, rows: list[dict], width: int, now_ms: int | None = None) 
 
     label, badge = status(state, now_ms)
     mode = state.get("mode", "live data")
-    header = [(" trading-lab ", "title"), ("│ PAPER ", "accent"),
+    header = [(f" {label} ", badge), (" trading-lab ", "title"), ("│ PAPER ", "accent"),
               (f"│ {state.get('symbol', '-')} {interval} ", "normal"),
               (f"│ {state.get('strategy_id', '-')} ", "normal"),
               (f"│ {mode} ", "warn" if "SIMULATED" in mode.upper() else "dim"),
-              (f"│ {datetime.now(timezone.utc):%H:%M:%S} UTC ", "dim"), (f" {label} ", badge)]
+              (f"│ {datetime.now(timezone.utc):%H:%M:%S} UTC ", "dim")]
 
     two_col = width >= 100
     colw = (width - 1) // 2 if two_col else width
@@ -278,7 +289,7 @@ def frame(state: dict, rows: list[dict], width: int, now_ms: int | None = None) 
         out += left + right
     out += box("EVENTS", events, width)
     out.append([(" PAPER TRADING · simulated fills · no real money · ", "dim"), ("q", "title"), (" quit", "dim")])
-    return out
+    return [clip(line, width) for line in out]
 
 
 def to_ansi(lines: list[Line]) -> str:
